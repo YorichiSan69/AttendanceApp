@@ -7,7 +7,6 @@ st.set_page_config(page_title="Student Attendance", layout="wide")
 
 
 def get_supabase():
-    # Per-user session client so logins are never shared across visitors
     if "supabase" not in st.session_state:
         st.session_state["supabase"] = create_client(
             st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
@@ -18,7 +17,7 @@ def get_supabase():
 supabase = get_supabase()
 
 # ==========================================
-# LOGIN GATE (Blocks everything until signed in)
+# LOGIN GATE
 # ==========================================
 if "user" not in st.session_state:
     st.session_state["user"] = None
@@ -32,7 +31,9 @@ if st.session_state["user"] is None:
         with st.form("login_form"):
             email = st.text_input("Staff Email")
             password = st.text_input("Password", type="password")
-            login_btn = st.form_submit_button("Sign In", type="primary", use_container_width=True)
+            login_btn = st.form_submit_button(
+                "Sign In", type="primary", use_container_width=True
+            )
 
             if login_btn:
                 if email and password:
@@ -49,13 +50,31 @@ if st.session_state["user"] is None:
     st.stop()
 
 # ==========================================
-# AUTHENTICATED APP (Only runs after sign-in)
+# CHECK ROLE & FETCH ALLOWED CLASSES
 # ==========================================
+user_email = st.session_state["user"].email.lower()
+admin_rows = (
+    supabase.table("admins").select("email").eq("email", user_email).execute().data
+)
+is_admin = len(admin_rows) > 0
+
+# RLS automatically returns all classes for admin, or only assigned classes for lecturers
+class_rows = (
+    supabase.table("classes").select("*").order("class_name").execute().data
+)
+allowed_classes = [c["class_name"] for c in class_rows]
+
+# RLS automatically returns only students in allowed classes
+students = (
+    supabase.table("students").select("*").order("full_name").execute().data
+)
+
 st.title("Student Attendance Platform")
 
 # --- Sidebar: Account & Add Student ---
 with st.sidebar:
-    st.caption(f"Signed in as: **{st.session_state['user'].email}**")
+    role_label = "Admin" if is_admin else "Lecturer"
+    st.caption(f"Signed in as: **{user_email}** ({role_label})")
     if st.button("Sign Out", use_container_width=True):
         supabase.auth.sign_out()
         st.session_state["user"] = None
@@ -64,115 +83,128 @@ with st.sidebar:
 
     st.divider()
     st.header("Add Student")
-    with st.form("add_student_form", clear_on_submit=True):
-        student_id = st.text_input("Student ID (e.g. STU004)")
-        full_name = st.text_input("Full Name")
-        class_name = st.text_input("Class (e.g. CS 101)")
-        add_btn = st.form_submit_button("Add Student")
 
-        if add_btn:
-            if student_id and full_name and class_name:
-                try:
-                    supabase.table("students").insert(
-                        {
-                            "student_id": student_id.strip(),
-                            "full_name": full_name.strip(),
-                            "class_name": class_name.strip(),
-                        }
-                    ).execute()
-                    st.success(f"Added {full_name}!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not add student: {e}")
-            else:
-                st.warning("Please fill in all three fields.")
+    if not allowed_classes:
+        if is_admin:
+            st.info("Create a class in the Manage Classes tab first.")
+        else:
+            st.info("No classes assigned to you yet. Ask the admin to assign your classes.")
+    else:
+        with st.form("add_student_form", clear_on_submit=True):
+            student_id = st.text_input("Student ID (e.g. STU004)")
+            full_name = st.text_input("Full Name")
+            class_name = st.selectbox("Class", allowed_classes)
+            add_btn = st.form_submit_button("Add Student")
 
-# --- Fetch all students once ---
-students = (
-    supabase.table("students")
-    .select("*")
-    .order("full_name")
-    .execute()
-    .data
-)
+            if add_btn:
+                if student_id and full_name:
+                    try:
+                        supabase.table("students").insert(
+                            {
+                                "student_id": student_id.strip(),
+                                "full_name": full_name.strip(),
+                                "class_name": class_name,
+                            }
+                        ).execute()
+                        st.success(f"Added {full_name} to {class_name}!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not add student: {e}")
+                else:
+                    st.warning("Please enter both Student ID and Full Name.")
 
-# --- Main Tabs ---
-tab_mark, tab_weekly, tab_log = st.tabs(
-    ["Mark Attendance", "Weekly Register & Export", "Full Raw Log"]
-)
+# --- Build Tabs (Admin gets a 4th tab to manage classes) ---
+tab_names = ["Mark Attendance", "Weekly Register & Export", "Full Raw Log"]
+if is_admin:
+    tab_names.append("Manage Classes (Admin)")
+
+tabs = st.tabs(tab_names)
+tab_mark, tab_weekly, tab_log = tabs[0], tabs[1], tabs[2]
 
 # ==========================================
 # TAB 1: MARK ATTENDANCE
 # ==========================================
 with tab_mark:
-    if not students:
-        st.info("No students yet. Add one using the sidebar.")
+    if not allowed_classes:
+        st.info("No classes available yet.")
+    elif not students:
+        st.info("No students in your classes yet. Add one using the sidebar.")
     else:
-        classes = sorted({s["class_name"] for s in students})
         col1, col2 = st.columns(2)
-        selected_class = col1.selectbox("Select Class", classes, key="mark_class")
+        selected_class = col1.selectbox("Select Class", allowed_classes, key="mark_class")
         selected_date = col2.date_input("Date", value=date.today(), key="mark_date")
 
         class_students = [s for s in students if s["class_name"] == selected_class]
 
-        existing_rows = (
-            supabase.table("attendance")
-            .select("student_id, status")
-            .eq("attendance_date", str(selected_date))
-            .execute()
-            .data
-        )
-        existing_map = {r["student_id"]: r["status"] for r in existing_rows}
+        if not class_students:
+            st.info(f"No students in {selected_class} yet. Add them in the sidebar.")
+        else:
+            existing_rows = (
+                supabase.table("attendance")
+                .select("student_id, status")
+                .eq("attendance_date", str(selected_date))
+                .execute()
+                .data
+            )
+            existing_map = {r["student_id"]: r["status"] for r in existing_rows}
 
-        if any(s["student_id"] in existing_map for s in class_students):
-            st.caption("Showing previously saved attendance for this date — edit and save to update.")
-
-        with st.form("attendance_form"):
-            st.subheader(f"Roll Call — {selected_class} ({selected_date})")
-            statuses = {}
-            options = ["Present", "Absent", "Late"]
-
-            for student in class_students:
-                sid = student["student_id"]
-                label = f"{sid} — {student['full_name']}"
-                saved_status = existing_map.get(sid, "Present")
-                default_idx = options.index(saved_status) if saved_status in options else 0
-
-                statuses[sid] = st.radio(
-                    label,
-                    options=options,
-                    index=default_idx,
-                    horizontal=True,
-                    key=f"status_{selected_class}_{selected_date}_{sid}",
+            if any(s["student_id"] in existing_map for s in class_students):
+                st.caption(
+                    "Showing previously saved attendance for this date — edit and save to update."
                 )
 
-            submitted = st.form_submit_button("Save Attendance", type="primary")
+            with st.form("attendance_form"):
+                st.subheader(f"Roll Call — {selected_class} ({selected_date})")
+                statuses = {}
+                options = ["Present", "Absent", "Late"]
 
-            if submitted:
-                records = [
-                    {
-                        "student_id": sid,
-                        "attendance_date": str(selected_date),
-                        "status": status,
-                    }
-                    for sid, status in statuses.items()
-                ]
-                supabase.table("attendance").upsert(
-                    records, on_conflict="student_id,attendance_date"
-                ).execute()
-                st.success(f"Saved attendance for {len(records)} students on {selected_date}!")
+                for student in class_students:
+                    sid = student["student_id"]
+                    label = f"{sid} — {student['full_name']}"
+                    saved_status = existing_map.get(sid, "Present")
+                    default_idx = (
+                        options.index(saved_status) if saved_status in options else 0
+                    )
+
+                    statuses[sid] = st.radio(
+                        label,
+                        options=options,
+                        index=default_idx,
+                        horizontal=True,
+                        key=f"status_{selected_class}_{selected_date}_{sid}",
+                    )
+
+                submitted = st.form_submit_button("Save Attendance", type="primary")
+
+                if submitted:
+                    records = [
+                        {
+                            "student_id": sid,
+                            "attendance_date": str(selected_date),
+                            "status": status,
+                        }
+                        for sid, status in statuses.items()
+                    ]
+                    supabase.table("attendance").upsert(
+                        records, on_conflict="student_id,attendance_date"
+                    ).execute()
+                    st.success(
+                        f"Saved attendance for {len(records)} students on {selected_date}!"
+                    )
 
 # ==========================================
 # TAB 2: WEEKLY DAY-BY-DAY REGISTER & EXPORT
 # ==========================================
 with tab_weekly:
-    if not students:
-        st.info("No students yet. Add one using the sidebar.")
+    if not allowed_classes or not students:
+        st.info("No students available to display yet.")
     else:
-        classes = sorted({s["class_name"] for s in students})
         col1, col2, col3 = st.columns([2, 2, 1])
 
-        weekly_class = col1.selectbox("Class", ["All"] + classes, key="weekly_class")
+        class_filter_options = (
+            ["All"] + allowed_classes if len(allowed_classes) > 1 else allowed_classes
+        )
+        weekly_class = col1.selectbox("Class", class_filter_options, key="weekly_class")
         picked_date = col2.date_input(
             "Pick any date in the week", value=date.today(), key="weekly_date"
         )
@@ -281,9 +313,12 @@ with tab_log:
         ]
         df = pd.DataFrame(flat_rows)
 
-        filter_class = st.selectbox(
-            "Filter by Class", ["All"] + sorted(df["Class"].unique()), key="log_class"
+        log_class_options = (
+            ["All"] + sorted(df["Class"].unique())
+            if len(df["Class"].unique()) > 1
+            else sorted(df["Class"].unique())
         )
+        filter_class = st.selectbox("Filter by Class", log_class_options, key="log_class")
         if filter_class != "All":
             df = df[df["Class"] == filter_class]
 
@@ -296,3 +331,43 @@ with tab_log:
             file_name="attendance_full_log.csv",
             mime="text/csv",
         )
+
+# ==========================================
+# TAB 4: MANAGE CLASSES (ADMIN ONLY)
+# ==========================================
+if is_admin:
+    with tabs[3]:
+        st.subheader("Create or Reassign a Class")
+        with st.form("manage_class_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            new_class_name = c1.text_input("Class Name (e.g. DCS 111)")
+            assigned_email = c2.text_input("Lecturer Email (e.g. lecturer1@school.edu)")
+            save_class_btn = st.form_submit_button("Save Class Assignment", type="primary")
+
+            if save_class_btn:
+                if new_class_name and assigned_email:
+                    try:
+                        supabase.table("classes").upsert(
+                            {
+                                "class_name": new_class_name.strip(),
+                                "lecturer_email": assigned_email.strip().lower(),
+                            },
+                            on_conflict="class_name",
+                        ).execute()
+                        st.success(
+                            f"Assigned {new_class_name.strip()} to {assigned_email.strip().lower()}!"
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not save class: {e}")
+                else:
+                    st.warning("Please enter both a class name and a lecturer email.")
+
+        st.subheader("Current Class Assignments")
+        if class_rows:
+            classes_df = pd.DataFrame(class_rows).rename(
+                columns={"class_name": "Class", "lecturer_email": "Assigned Lecturer"}
+            )
+            st.dataframe(classes_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No classes created yet.")
